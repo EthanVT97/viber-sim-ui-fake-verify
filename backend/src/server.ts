@@ -1,32 +1,38 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import dotenv from 'dotenv';
 import rateLimit from 'express-rate-limit';
 import { createServer } from 'http';
-import { Server } from 'socket.io';
-import dotenv from 'dotenv';
+import { Server as SocketIOServer } from 'socket.io';
+
 import { botRoutes } from './routes/bot.routes';
+import { viberRoutes } from './routes/viber.routes';
 import { sessionRoutes } from './routes/session.routes';
 import { webhookRoutes } from './routes/webhook.routes';
+
+import { maskBotInfo } from './middleware/maskBotInfo.middleware';
 import { errorHandler } from './middleware/error.middleware';
 import { authMiddleware } from './middleware/auth.middleware';
 import { logger } from './utils/logger';
-import { ViberBotManager } from './services/viber-bot.service';
+
 import { DatabaseService } from './services/database.service';
+import { ViberBotManager } from './services/viber-bot.service';
 
 dotenv.config();
 
 const app = express();
 const server = createServer(app);
-const io = new Server(server, {
+const io = new SocketIOServer(server, {
   cors: {
-    origin: process.env.FRONTEND_URL || "http://localhost:3000",
-    methods: ["GET", "POST"],
+    origin: process.env.FRONTEND_URL || 'http://localhost:3000',
     credentials: true
   }
 });
 
 const PORT = process.env.PORT || 8080;
+
+// Rate Limiter
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100,
@@ -35,34 +41,34 @@ const limiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Security middleware
+// Security
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
+      scriptSrc: ["'self'", "'unsafe-inline'"],
       styleSrc: ["'self'", "'unsafe-inline'"],
-      scriptSrc: ["'self'"],
-      imgSrc: ["'self'", "data:", "https:"],
-    },
+      imgSrc: ["'self'", "data:", "https:"]
+    }
   },
   crossOriginEmbedderPolicy: false
 }));
-
 app.use(cors({
-  origin: process.env.FRONTEND_URL || "http://localhost:3000",
+  origin: process.env.FRONTEND_URL || 'http://localhost:3000',
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
+  allowedHeaders: ['Content-Type', 'Authorization']
 }));
 
-app.use(limiter);
+// Body parser
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+app.use(limiter);
 
 // Health check
 app.get('/health', (req, res) => {
-  res.status(200).json({ 
-    status: 'healthy', 
+  res.status(200).json({
+    status: 'healthy',
     timestamp: new Date().toISOString(),
     uptime: process.uptime()
   });
@@ -72,22 +78,24 @@ app.get('/health', (req, res) => {
 app.use('/api/bot', authMiddleware, botRoutes);
 app.use('/api/session', authMiddleware, sessionRoutes);
 app.use('/api/webhook', webhookRoutes);
+app.use('/viber/info', maskBotInfo, viberRoutes); // masked
+app.use('/viber', viberRoutes); // unmasked
 
-// Error handling
+// Error handler
 app.use(errorHandler);
 
-// Socket.IO connection handling
+// Socket.io handlers
 io.on('connection', (socket) => {
-  logger.info(`Client connected: ${socket.id}`);
-  
+  logger.info(`Socket connected: ${socket.id}`);
+
   socket.on('bot:status', async (data) => {
     try {
       const botManager = ViberBotManager.getInstance();
       const status = await botManager.getBotStatus(data.botId);
       socket.emit('bot:status:update', status);
-    } catch (error) {
-      logger.error('Socket bot status error:', error);
-      socket.emit('error', { message: 'Failed to get bot status' });
+    } catch (err) {
+      logger.error('Socket bot status error:', err);
+      socket.emit('error', { message: 'Failed to fetch bot status' });
     }
   });
 
@@ -96,52 +104,44 @@ io.on('connection', (socket) => {
       const botManager = ViberBotManager.getInstance();
       await botManager.sendMessage(data.botId, data.message);
       socket.emit('bot:message:sent', { success: true });
-    } catch (error) {
-      logger.error('Socket bot message error:', error);
+    } catch (err) {
+      logger.error('Socket message error:', err);
       socket.emit('error', { message: 'Failed to send message' });
     }
   });
 
   socket.on('disconnect', () => {
-    logger.info(`Client disconnected: ${socket.id}`);
+    logger.info(`Socket disconnected: ${socket.id}`);
   });
 });
 
-// Initialize services
+// Bootstrap + Shutdown
 async function initializeServer() {
   try {
     await DatabaseService.initialize();
-    logger.info('Database initialized');
-    
+    logger.info('✅ Database connected');
+
     const botManager = ViberBotManager.getInstance();
     await botManager.initialize();
-    logger.info('Viber bot manager initialized');
-    
+    logger.info('🤖 Viber Bot Manager initialized');
+
     server.listen(PORT, () => {
-      logger.info(`Server running on port ${PORT}`);
-      logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
+      logger.info(`🚀 Server running at http://localhost:${PORT}`);
     });
-  } catch (error) {
-    logger.error('Failed to initialize server:', error);
+  } catch (err) {
+    logger.error('❌ Initialization error:', err);
     process.exit(1);
   }
 }
 
-// Graceful shutdown
-process.on('SIGTERM', () => {
-  logger.info('SIGTERM received, shutting down gracefully');
-  server.close(() => {
-    logger.info('Process terminated');
-    process.exit(0);
-  });
+process.on('SIGINT', () => {
+  logger.info('🛑 SIGINT received. Shutting down...');
+  server.close(() => process.exit(0));
 });
 
-process.on('SIGINT', () => {
-  logger.info('SIGINT received, shutting down gracefully');
-  server.close(() => {
-    logger.info('Process terminated');
-    process.exit(0);
-  });
+process.on('SIGTERM', () => {
+  logger.info('🛑 SIGTERM received. Shutting down...');
+  server.close(() => process.exit(0));
 });
 
 initializeServer();
